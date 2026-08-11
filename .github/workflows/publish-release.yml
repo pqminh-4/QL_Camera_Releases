@@ -1,0 +1,102 @@
+name: Publish QL Camera release
+
+on:
+  repository_dispatch:
+    types: [ql-camera-release]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+  packages: read
+
+concurrency:
+  group: ql-camera-release-${{ github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.client_payload.tag }}
+      SOURCE_COMMIT: ${{ github.event.client_payload.commit }}
+      API_IMAGE: ${{ github.event.client_payload.api_image }}
+      WEB_IMAGE: ${{ github.event.client_payload.web_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kiểm tra payload phát hành
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$API_IMAGE" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@sha256:[a-f0-9]{64}$ ]]
+          [[ "$WEB_IMAGE" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*@sha256:[a-f0-9]{64}$ ]]
+          echo "BUNDLE_NAME=ql-camera-deploy-bundle-${TAG}.tar.gz" >>"$GITHUB_ENV"
+      - name: Tải draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release
+      - name: Xác minh checksum, manifest và ranh giới artifact
+        run: |
+          cd release
+          sha256sum --check "${BUNDLE_NAME}.sha256"
+          sha256sum --check ql-camera-agent-linux-amd64.sha256
+          [[ "$(jq -r '.version' release-manifest.json)" == "$TAG" ]]
+          [[ "$(jq -r '.commit' release-manifest.json)" == "$SOURCE_COMMIT" ]]
+          [[ "$(jq -r '.images.api' release-manifest.json)" == "$API_IMAGE" ]]
+          [[ "$(jq -r '.images.web' release-manifest.json)" == "$WEB_IMAGE" ]]
+          tar -tzf "$BUNDLE_NAME" > bundle-files.txt
+          if grep -Eq '\.(ts|tsx|go|map)$|(^|/)(\.git|node_modules|dist|tests?|coverage|secrets|data|storage)(/|$)|(^|/)\.env$' bundle-files.txt; then
+            echo 'Deploy bundle chứa tệp bị cấm.' >&2
+            exit 1
+          fi
+          if grep -Eq '(^/|(^|/)\.\.(/|$))' bundle-files.txt; then
+            echo 'Deploy bundle chứa đường dẫn không an toàn.' >&2
+            exit 1
+          fi
+      - name: Tạo build provenance cho artifact
+        id: attest
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: |
+            release/ql-camera-deploy-bundle-${{ github.event.client_payload.tag }}.tar.gz
+            release/ql-camera-agent-linux-amd64
+            release/release-manifest.json
+            release/ql-camera-sbom.spdx.json
+          create-storage-record: false
+      - name: Đính kèm Sigstore provenance vào release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE_PATH" release/ql-camera-build-provenance.sigstore.json
+          gh release upload "$TAG" release/ql-camera-build-provenance.sigstore.json --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Xác minh pull image ẩn danh và nội dung runtime
+        run: |
+          docker logout ghcr.io || true
+          docker pull "$API_IMAGE"
+          docker pull "$WEB_IMAGE"
+          docker run --rm --entrypoint sh "$API_IMAGE" -c "test -f /workspace/apps/api/dist/server.js; ! find /workspace/apps /workspace/packages -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.map' -o -name '*.test.js' \) -print -quit | grep -q ."
+          docker run --rm --entrypoint sh "$API_IMAGE" -c "! find /workspace/node_modules/.pnpm -maxdepth 1 -type d \( -name 'vitest@*' -o -name 'typescript@*' -o -name '@playwright+test@*' \) -print -quit | grep -q ."
+          docker run --rm --entrypoint sh "$WEB_IMAGE" -c "test -f /usr/share/nginx/html/index.html; ! find /usr/share/nginx/html -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.map' \) -print -quit | grep -q ."
+      - name: Kiểm tra Compose ở chế độ image
+        run: |
+          mkdir -p smoke
+          tar -xzf "release/$BUNDLE_NAME" -C smoke
+          mkdir -p smoke/secrets smoke/data/frigate
+          printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n' > smoke/secrets/master_key
+          printf 'postgres-test\n' > smoke/secrets/postgres_password
+          printf '{"token":"test","expiresAt":"2099-01-01T00:00:00Z"}\n' > smoke/secrets/bootstrap_token.json
+          printf 'turn-test\n' > smoke/secrets/turn_shared_secret
+          printf 'mqtt-test\n' > smoke/secrets/mqtt_password
+          printf 'ql_camera:$7$101$test\n' > smoke/secrets/mosquitto_passwords
+          sed 's/{FRIGATE_MQTT_PASSWORD}/test/' smoke/infra/frigate/config.example.yml > smoke/data/frigate/config.yml
+          sed -e 's/{TURN_SHARED_SECRET}/test/' -e 's/{TURN_REALM}/camera.example.com/' smoke/infra/coturn/turnserver.conf > smoke/infra/coturn/turnserver.generated.conf
+          printf 'QL_CAMERA_API_IMAGE=%s\nQL_CAMERA_WEB_IMAGE=%s\nQL_CAMERA_DATA_DIR=%s/smoke/data\nQL_CAMERA_MEDIA_DIR=%s/smoke/storage\nFRIGATE_RTSP_PASSWORD=test\n' "$API_IMAGE" "$WEB_IMAGE" "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE" > smoke/.env
+          docker compose -f smoke/docker-compose.yml config --quiet
+      - name: Công bố release sau khi smoke đạt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
