@@ -56,8 +56,17 @@ jobs:
             echo 'Deploy bundle chứa đường dẫn không an toàn.' >&2
             exit 1
           fi
+      - name: Kiểm tra provenance đã có
+        id: provenance
+        run: |
+          if [[ -f release/ql-camera-build-provenance.sigstore.json ]]; then
+            echo 'exists=true' >>"$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >>"$GITHUB_OUTPUT"
+          fi
       - name: Tạo build provenance cho artifact
         id: attest
+        if: steps.provenance.outputs.exists != 'true'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
           subject-path: |
@@ -67,6 +76,7 @@ jobs:
             release/ql-camera-sbom.spdx.json
           create-storage-record: false
       - name: Đính kèm Sigstore provenance vào release
+        if: steps.provenance.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PROVENANCE_PATH: ${{ steps.attest.outputs.bundle-path }}
