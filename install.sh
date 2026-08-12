@@ -11,6 +11,62 @@ AGENT_GROUP_ID="${QL_CAMERA_AGENT_GID:-1999}"
 INSTALL_MODE="source"
 RELEASE_API_IMAGE=""
 RELEASE_WEB_IMAGE=""
+OWNER_CREATED="false"
+OWNER_ALREADY_EXISTS="false"
+INSTALL_OWNER_NAME=""
+INSTALL_OWNER_EMAIL=""
+INSTALL_OWNER_PASSWORD=""
+EXISTING_INSTALL="false"
+APT_INDEX_UPDATED="false"
+
+REQUIRED_HOST_PACKAGES=(
+  ca-certificates
+  curl
+  gnupg
+  jq
+  tar
+  gzip
+  coreutils
+  grep
+  sed
+  mawk
+  passwd
+  hostname
+  libc-bin
+)
+OPTIONAL_HOST_PACKAGES=(usbutils)
+REQUIRED_HOST_COMMANDS=(
+  curl
+  jq
+  tar
+  gzip
+  sha256sum
+  awk
+  grep
+  sed
+  groupadd
+  systemctl
+  gpg
+  hostname
+  getent
+  date
+  df
+  uname
+  install
+  base64
+  dd
+  tr
+  seq
+  mktemp
+  readlink
+  cp
+  chown
+  chmod
+)
+MISSING_REQUIRED_PACKAGES=()
+MISSING_OPTIONAL_PACKAGES=()
+
+[[ -f "$INSTALL_DIR/docker-compose.yml" ]] && EXISTING_INSTALL="true"
 
 cleanup_items=()
 cleanup() {
@@ -29,14 +85,35 @@ note() {
   printf '\n[QL Camera] %s\n' "$1"
 }
 
+dependency_status() {
+  printf '[%s] %s\n' "$1" "$2"
+}
+
+dependency_warning() {
+  dependency_status "Cảnh báo" "$1" >&2
+}
+
+has_interactive_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] && { true </dev/tty; } 2>/dev/null
+}
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || fail "Hãy chạy installer bằng sudo."
 }
 
-preflight() {
+systemd_is_running() {
+  [[ -d /run/systemd/system ]] && systemctl show --property=Version --value >/dev/null 2>&1
+}
+
+bootstrap_environment() {
   [[ "$INSTALL_DIR" == /* && "$INSTALL_DIR" != "/" ]] || fail "QL_CAMERA_INSTALL_DIR phải là đường dẫn tuyệt đối khác /."
   [[ "$DATA_DIR" == /* && "$DATA_DIR" != "/" ]] || fail "QL_CAMERA_DATA_DIR phải là đường dẫn tuyệt đối khác /."
   [[ "$MEDIA_DIR" == /* && "$MEDIA_DIR" != "/" ]] || fail "QL_CAMERA_MEDIA_DIR phải là đường dẫn tuyệt đối khác /."
+  [[ -n "${BASH_VERSION:-}" ]] || fail "Installer cần được chạy bằng Bash."
+  command -v apt-get >/dev/null 2>&1 || fail "Máy thiếu APT; installer chỉ hỗ trợ Ubuntu Server dùng APT/DPKG."
+  command -v dpkg >/dev/null 2>&1 || fail "Máy thiếu DPKG; installer chỉ hỗ trợ Ubuntu Server dùng APT/DPKG."
+  command -v dpkg-query >/dev/null 2>&1 || fail "Máy thiếu dpkg-query; hãy sửa bộ quản lý gói trước khi cài QL Camera."
+  command -v systemctl >/dev/null 2>&1 || fail "Máy thiếu systemctl; QL Camera cần Ubuntu Server chạy bằng systemd."
   [[ -r /etc/os-release ]] || fail "Không nhận diện được hệ điều hành."
   # shellcheck disable=SC1091
   source /etc/os-release
@@ -45,35 +122,180 @@ preflight() {
     24.04|26.04) ;;
     *) fail "Chỉ hỗ trợ Ubuntu 24.04 hoặc 26.04 LTS." ;;
   esac
-  [[ "$(uname -m)" == "x86_64" ]] || fail "Bản đầu chỉ hỗ trợ amd64/x86_64."
-  local available_kb
-  available_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
-  (( available_kb >= 15 * 1024 * 1024 )) || fail "Cần tối thiểu 15 GB trống để cài đặt."
+  [[ "$(dpkg --print-architecture)" == "amd64" ]] || fail "Bản đầu chỉ hỗ trợ amd64/x86_64."
+  systemd_is_running || fail "Không phát hiện systemd đang chạy. Không hỗ trợ container, WSL không bật systemd hoặc hệ init khác."
+  dependency_status "Sẵn sàng" "Ubuntu ${VERSION_ID} amd64, APT/DPKG và systemd"
 }
 
-install_docker() {
-  local missing_tools=()
-  local tool
-  for tool in ca-certificates curl gnupg jq tar; do
-    dpkg -s "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
-  done
-  if (( ${#missing_tools[@]} > 0 )); then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_tools[@]}"
-  fi
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    systemctl enable --now docker
+package_is_installed() {
+  local status
+  status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" || return 1
+  [[ "$status" == ii* ]]
+}
+
+required_command_available() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+run_apt_get() {
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
+ensure_apt_index() {
+  if [[ "$APT_INDEX_UPDATED" == "true" ]]; then
     return
   fi
+  run_apt_get update || return 1
+  APT_INDEX_UPDATED="true"
+}
+
+inventory_host_dependencies() {
+  local package
+  MISSING_REQUIRED_PACKAGES=()
+  MISSING_OPTIONAL_PACKAGES=()
+  note "Kiểm tra phần bổ trợ của Ubuntu"
+  for package in "${REQUIRED_HOST_PACKAGES[@]}"; do
+    if package_is_installed "$package"; then
+      dependency_status "Sẵn sàng" "Gói bắt buộc: $package"
+    else
+      dependency_status "Thiếu" "Gói bắt buộc: $package"
+      MISSING_REQUIRED_PACKAGES+=("$package")
+    fi
+  done
+  for package in "${OPTIONAL_HOST_PACKAGES[@]}"; do
+    if package_is_installed "$package"; then
+      dependency_status "Sẵn sàng" "Tiện ích phần cứng: $package"
+    else
+      dependency_status "Thiếu" "Tiện ích phần cứng: $package"
+      MISSING_OPTIONAL_PACKAGES+=("$package")
+    fi
+  done
+}
+
+postcheck_host_dependencies() {
+  local package tool
+  local failures=()
+  for package in "${REQUIRED_HOST_PACKAGES[@]}"; do
+    package_is_installed "$package" || failures+=("gói $package")
+  done
+  for tool in "${REQUIRED_HOST_COMMANDS[@]}"; do
+    required_command_available "$tool" || failures+=("lệnh $tool")
+  done
+  if (( ${#failures[@]} > 0 )); then
+    fail "Hậu kiểm phần bổ trợ thất bại: ${failures[*]}. Hãy sửa APT/DPKG rồi chạy lại installer."
+  fi
+  dependency_status "Sẵn sàng" "Hậu kiểm toàn bộ lệnh bắt buộc đã đạt"
+  if package_is_installed usbutils && required_command_available lsusb; then
+    dependency_status "Sẵn sàng" "Có thể nhận diện thiết bị Coral USB bằng lsusb"
+  else
+    dependency_warning "Thiếu usbutils/lsusb; QL Camera vẫn chạy nhưng có thể không tự nhận diện Coral USB."
+  fi
+}
+
+install_host_dependencies() {
+  local package
+  inventory_host_dependencies
+  if (( ${#MISSING_REQUIRED_PACKAGES[@]} > 0 )); then
+    note "Cài các phần bổ trợ bắt buộc còn thiếu"
+    ensure_apt_index || fail "Không cập nhật được danh mục APT. Kiểm tra Internet và cấu hình repository rồi chạy lại."
+    run_apt_get install -y --no-install-recommends "${MISSING_REQUIRED_PACKAGES[@]}" ||
+      fail "Không cài được phần bổ trợ bắt buộc. QL Camera chưa được tải hoặc cấu hình."
+    for package in "${MISSING_REQUIRED_PACKAGES[@]}"; do
+      if package_is_installed "$package"; then
+        dependency_status "Đã cài" "Gói bắt buộc: $package"
+      fi
+    done
+  fi
+  if (( ${#MISSING_OPTIONAL_PACKAGES[@]} > 0 )); then
+    note "Cài tiện ích nhận diện phần cứng"
+    if ! ensure_apt_index; then
+      dependency_warning "Không cập nhật được APT để cài usbutils; tiếp tục mà không tự nhận diện Coral USB."
+    elif run_apt_get install -y --no-install-recommends "${MISSING_OPTIONAL_PACKAGES[@]}"; then
+      for package in "${MISSING_OPTIONAL_PACKAGES[@]}"; do
+        package_is_installed "$package" && dependency_status "Đã cài" "Tiện ích phần cứng: $package"
+      done
+    else
+      dependency_warning "Không cài được usbutils; tiếp tục mà không tự nhận diện Coral USB."
+    fi
+  fi
+  postcheck_host_dependencies
+}
+
+preflight() {
+  [[ "$(uname -m)" == "x86_64" ]] || fail "Bản đầu chỉ hỗ trợ amd64/x86_64."
+  local available_kb required_kb
+  available_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+  required_kb=$((15 * 1024 * 1024))
+  if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+    # Lần sửa hoặc nâng cấp có thể tái sử dụng image hiện hữu nên cần ít dung lượng tạm hơn.
+    required_kb=$((5 * 1024 * 1024))
+  fi
+  (( available_kb >= required_kb )) || fail "Không đủ dung lượng trống: cần tối thiểu $((required_kb / 1024 / 1024)) GB."
+  if [[ "$EXISTING_INSTALL" != "true" ]] && ! has_interactive_tty &&
+    [[ -z "${QL_CAMERA_OWNER_NAME:-}" || -z "${QL_CAMERA_OWNER_EMAIL:-}" ]]; then
+    fail "Cài đặt không có terminal cần đặt đủ QL_CAMERA_OWNER_NAME và QL_CAMERA_OWNER_EMAIL."
+  fi
+  if [[ -n "${QL_CAMERA_OWNER_NAME:-}" && -z "${QL_CAMERA_OWNER_EMAIL:-}" ]] ||
+    [[ -z "${QL_CAMERA_OWNER_NAME:-}" && -n "${QL_CAMERA_OWNER_EMAIL:-}" ]]; then
+    fail "Phải đặt đồng thời QL_CAMERA_OWNER_NAME và QL_CAMERA_OWNER_EMAIL."
+  fi
+}
+
+docker_command_available() {
+  required_command_available docker
+}
+
+docker_footprints_exist() {
+  local package
+  docker_command_available && return 0
+  for package in docker-ce docker-ce-cli docker.io docker-compose docker-compose-v2 docker-compose-plugin containerd containerd.io podman-docker; do
+    package_is_installed "$package" && return 0
+  done
+  [[ -e /var/lib/docker || -e /etc/docker || -e /etc/systemd/system/docker.service ||
+    -e /lib/systemd/system/docker.service || -e /usr/lib/systemd/system/docker.service ]]
+}
+
+ensure_docker_service() {
+  systemctl is-enabled --quiet docker.service || systemctl enable docker.service
+  systemctl is-active --quiet docker.service || systemctl start docker.service
+}
+
+docker_runtime_healthy() {
+  docker info --format '{{.ServerVersion}}' >/dev/null 2>&1
+}
+
+docker_compose_healthy() {
+  docker compose version >/dev/null 2>&1
+}
+
+docker_compose_can_parse() {
+  docker compose -f - config --quiet >/dev/null 2>&1 <<'YAML'
+services:
+  ql_camera_dependency_check:
+    image: busybox:1.36
+YAML
+}
+
+validate_docker_runtime() {
+  docker_command_available || fail "Không tìm thấy lệnh docker sau khi cài. Hãy sửa Docker rồi chạy lại installer."
+  if ! docker_runtime_healthy; then
+    ensure_docker_service || fail "Docker daemon đang dừng và không bật được docker.service. Installer không tự thay thế Docker hiện hữu."
+    docker_runtime_healthy || fail "Docker daemon vẫn không hoạt động. Chạy 'systemctl status docker' và 'docker info' để chẩn đoán."
+  fi
+  docker_compose_healthy || fail "Thiếu hoặc lỗi Docker Compose plugin. Installer không tự thay đổi bộ Docker hiện hữu."
+  docker_compose_can_parse || fail "Docker Compose không đọc được cấu hình chuẩn. Hãy sửa hoặc nâng cấp Docker/Compose rồi chạy lại."
+}
+
+install_docker_engine() {
+  local docker_key docker_source
   note "Cài Docker Engine và Compose từ repository chính thức"
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg jq tar
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
+  docker_key="$(mktemp)"
+  docker_source="$(mktemp)"
+  cleanup_items+=("$docker_key" "$docker_source")
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$docker_key" || fail "Không tải được khóa repository Docker chính thức."
   # shellcheck disable=SC1091
   source /etc/os-release
-  cat >/etc/apt/sources.list.d/docker.sources <<EOF
+  cat >"$docker_source" <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
 Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
@@ -81,10 +303,30 @@ Components: stable
 Architectures: amd64
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
-  docker run --rm hello-world >/dev/null
+  install -m 0755 -d /etc/apt/keyrings
+  install -m 0644 "$docker_key" /etc/apt/keyrings/docker.asc
+  install -m 0644 "$docker_source" /etc/apt/sources.list.d/docker.sources
+  APT_INDEX_UPDATED="false"
+  ensure_apt_index || fail "Không cập nhật được repository Docker chính thức."
+  run_apt_get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin ||
+    fail "Không cài được Docker Engine. Installer không gỡ hoặc thay thế gói xung đột tự động."
+  ensure_docker_service || fail "Đã cài Docker nhưng không bật được docker.service cho lần khởi động hiện tại và các lần reboot sau."
+}
+
+ensure_docker() {
+  note "Kiểm tra Docker Engine và Docker Compose"
+  if docker_footprints_exist; then
+    if ! docker_command_available; then
+      fail "Phát hiện Docker/containerd hiện hữu nhưng không có lệnh docker. Installer không tự gỡ hoặc thay thế; hãy sửa bộ Docker hiện tại rồi chạy lại."
+    fi
+    validate_docker_runtime
+    dependency_status "Sẵn sàng" "Giữ nguyên Docker Engine và Docker Compose hiện hữu"
+    return
+  fi
+  dependency_status "Thiếu" "Docker Engine và Docker Compose"
+  install_docker_engine
+  validate_docker_runtime
+  dependency_status "Đã cài" "Docker Engine, containerd, Buildx và Docker Compose plugin"
 }
 
 copy_source_checkout() {
@@ -116,6 +358,25 @@ copy_source_checkout() {
 release_asset_url() {
   local release_json="$1" asset_name="$2"
   jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json" | head -n 1
+}
+
+release_asset_download_url() {
+  local version="$1" asset_name="$2"
+  printf 'https://github.com/%s/releases/download/%s/%s\n' "$RELEASE_REPOSITORY" "$version" "$asset_name"
+}
+
+latest_release_version_from_page() {
+  local release_page_url version
+  release_page_url="$(curl -fsSL --connect-timeout 20 --retry 5 --retry-delay 2 --retry-all-errors -o /dev/null -w '%{url_effective}' "https://github.com/${RELEASE_REPOSITORY}/releases/latest")" || return 1
+  version="${release_page_url##*/}"
+  [[ "$release_page_url" == "https://github.com/${RELEASE_REPOSITORY}/releases/tag/${version}" ]] || return 1
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+download_release_asset() {
+  local url="$1" output_path="$2"
+  curl -fsSL --connect-timeout 20 --retry 5 --retry-delay 2 --retry-all-errors "$url" -o "$output_path"
 }
 
 verify_checksum() {
@@ -160,24 +421,39 @@ download_source() {
   local bundle_url bundle_checksum_url agent_url agent_checksum_url manifest_url staging_dir
   temp_dir="$(mktemp -d)"
   cleanup_items+=("$temp_dir")
-  release_json="$(curl -fsSL "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/latest")" || fail "Không tải được metadata release public."
-  version="$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.-]+)?$"))' <<<"$release_json")" || fail "Release mới nhất không có tag phiên bản hợp lệ."
+  release_json=""
+  if release_json="$(curl -fsSL "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/latest")" &&
+    version="$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.-]+)?$"))' <<<"$release_json")"; then
+    :
+  else
+    release_json=""
+    note "GitHub API không khả dụng; chuyển sang trang release public"
+    version="$(latest_release_version_from_page)" || fail "Không xác định được release public mới nhất."
+  fi
   bundle_name="ql-camera-deploy-bundle-${version}.tar.gz"
   bundle_checksum_name="${bundle_name}.sha256"
   agent_name="ql-camera-agent-linux-amd64"
   agent_checksum_name="${agent_name}.sha256"
   manifest_name="release-manifest.json"
-  bundle_url="$(release_asset_url "$release_json" "$bundle_name")" || fail "Release thiếu deploy bundle."
-  bundle_checksum_url="$(release_asset_url "$release_json" "$bundle_checksum_name")" || fail "Release thiếu checksum deploy bundle."
-  agent_url="$(release_asset_url "$release_json" "$agent_name")" || fail "Release thiếu host-agent."
-  agent_checksum_url="$(release_asset_url "$release_json" "$agent_checksum_name")" || fail "Release thiếu checksum host-agent."
-  manifest_url="$(release_asset_url "$release_json" "$manifest_name")" || fail "Release thiếu manifest."
+  if [[ -n "$release_json" ]]; then
+    bundle_url="$(release_asset_url "$release_json" "$bundle_name")" || fail "Release thiếu deploy bundle."
+    bundle_checksum_url="$(release_asset_url "$release_json" "$bundle_checksum_name")" || fail "Release thiếu checksum deploy bundle."
+    agent_url="$(release_asset_url "$release_json" "$agent_name")" || fail "Release thiếu host-agent."
+    agent_checksum_url="$(release_asset_url "$release_json" "$agent_checksum_name")" || fail "Release thiếu checksum host-agent."
+    manifest_url="$(release_asset_url "$release_json" "$manifest_name")" || fail "Release thiếu manifest."
+  else
+    bundle_url="$(release_asset_download_url "$version" "$bundle_name")"
+    bundle_checksum_url="$(release_asset_download_url "$version" "$bundle_checksum_name")"
+    agent_url="$(release_asset_download_url "$version" "$agent_name")"
+    agent_checksum_url="$(release_asset_download_url "$version" "$agent_checksum_name")"
+    manifest_url="$(release_asset_download_url "$version" "$manifest_name")"
+  fi
   note "Tải QL Camera ${version}"
-  curl -fsSL "$bundle_url" -o "$temp_dir/$bundle_name"
-  curl -fsSL "$bundle_checksum_url" -o "$temp_dir/$bundle_checksum_name"
-  curl -fsSL "$agent_url" -o "$temp_dir/$agent_name"
-  curl -fsSL "$agent_checksum_url" -o "$temp_dir/$agent_checksum_name"
-  curl -fsSL "$manifest_url" -o "$temp_dir/$manifest_name"
+  download_release_asset "$bundle_url" "$temp_dir/$bundle_name" || fail "Không tải được deploy bundle."
+  download_release_asset "$bundle_checksum_url" "$temp_dir/$bundle_checksum_name" || fail "Không tải được checksum deploy bundle."
+  download_release_asset "$agent_url" "$temp_dir/$agent_name" || fail "Không tải được host-agent."
+  download_release_asset "$agent_checksum_url" "$temp_dir/$agent_checksum_name" || fail "Không tải được checksum host-agent."
+  download_release_asset "$manifest_url" "$temp_dir/$manifest_name" || fail "Không tải được manifest."
   verify_checksum "$temp_dir/$bundle_checksum_name" "$temp_dir/$bundle_name"
   verify_checksum "$temp_dir/$agent_checksum_name" "$temp_dir/$agent_name"
   [[ "$(jq -er '.version' "$temp_dir/$manifest_name")" == "$version" ]] || fail "Phiên bản manifest không khớp release."
@@ -200,6 +476,46 @@ download_source() {
 
 random_secret() {
   dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n'
+}
+
+trim_value() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$1"
+}
+
+valid_owner_name() {
+  local value
+  value="$(trim_value "$1")"
+  (( ${#value} >= 2 && ${#value} <= 80 ))
+}
+
+valid_owner_email() {
+  local value="$1"
+  (( ${#value} <= 254 )) && [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+collect_owner_identity() {
+  if [[ -n "${QL_CAMERA_OWNER_NAME:-}" && -n "${QL_CAMERA_OWNER_EMAIL:-}" ]]; then
+    INSTALL_OWNER_NAME="$(trim_value "$QL_CAMERA_OWNER_NAME")"
+    INSTALL_OWNER_EMAIL="$(trim_value "$QL_CAMERA_OWNER_EMAIL")"
+    valid_owner_name "$INSTALL_OWNER_NAME" || fail "QL_CAMERA_OWNER_NAME phải có từ 2 đến 80 ký tự."
+    valid_owner_email "$INSTALL_OWNER_EMAIL" || fail "QL_CAMERA_OWNER_EMAIL không hợp lệ."
+    return
+  fi
+
+  has_interactive_tty || fail "Không có terminal để nhập Owner. Hãy đặt QL_CAMERA_OWNER_NAME và QL_CAMERA_OWNER_EMAIL."
+  note "Thiết lập tài khoản Owner đầu tiên"
+  while true; do
+    read -r -p "Tên hiển thị Owner: " INSTALL_OWNER_NAME </dev/tty
+    INSTALL_OWNER_NAME="$(trim_value "$INSTALL_OWNER_NAME")"
+    valid_owner_name "$INSTALL_OWNER_NAME" && break
+    printf 'Tên hiển thị phải có từ 2 đến 80 ký tự.\n' >/dev/tty
+  done
+  while true; do
+    read -r -p "Email Owner: " INSTALL_OWNER_EMAIL </dev/tty
+    INSTALL_OWNER_EMAIL="$(trim_value "$INSTALL_OWNER_EMAIL")"
+    valid_owner_email "$INSTALL_OWNER_EMAIL" && break
+    printf 'Email không hợp lệ. Hãy nhập lại.\n' >/dev/tty
+  done
 }
 
 read_env_value() {
@@ -261,6 +577,8 @@ generate_configuration() {
   [[ -n "$rtsp_password" ]] || rtsp_password="$(random_secret)"
   turn_secret="$(<"$INSTALL_DIR/secrets/turn_shared_secret")"
   if [[ -s "$INSTALL_DIR/secrets/mosquitto_passwords" ]]; then
+    # Công cụ mosquitto_passwd yêu cầu file do root sở hữu khi cập nhật.
+    chown root:root "$INSTALL_DIR/secrets/mosquitto_passwords"
     docker run --rm -v "$INSTALL_DIR/secrets:/work" eclipse-mosquitto:2.0.22 \
       mosquitto_passwd -b /work/mosquitto_passwords ql_camera "$mqtt_password"
   else
@@ -309,6 +627,19 @@ generate_configuration() {
   chmod 0700 "$INSTALL_DIR/secrets" "$DATA_DIR/frigate"
   chmod 0750 "$DATA_DIR/runtime-secrets"
   chmod 0600 "$INSTALL_DIR/secrets/"* "$INSTALL_DIR/.env" "$DATA_DIR/frigate/config.yml" "$INSTALL_DIR/infra/coturn/turnserver.generated.conf"
+  # API chạy non-root với GID 65532; chỉ group này được đọc các secret API cần dùng.
+  chown root:65532 \
+    "$INSTALL_DIR/secrets/master_key" \
+    "$INSTALL_DIR/secrets/postgres_password" \
+    "$INSTALL_DIR/secrets/bootstrap_token.json" \
+    "$INSTALL_DIR/secrets/turn_shared_secret" \
+    "$INSTALL_DIR/secrets/mqtt_password"
+  chmod 0640 \
+    "$INSTALL_DIR/secrets/master_key" \
+    "$INSTALL_DIR/secrets/postgres_password" \
+    "$INSTALL_DIR/secrets/bootstrap_token.json" \
+    "$INSTALL_DIR/secrets/turn_shared_secret" \
+    "$INSTALL_DIR/secrets/mqtt_password"
   # User Mosquitto trong image chính thức dùng UID/GID 1883 và chỉ cần quyền đọc file mật khẩu.
   chown 1883:1883 "$INSTALL_DIR/secrets/mosquitto_passwords"
   INSTALL_BOOTSTRAP_TOKEN="$bootstrap_token"
@@ -332,6 +663,15 @@ install_host_agent() {
   systemctl enable --now ql-camera-agent.service
 }
 
+refresh_bootstrap_credential() {
+  local expires_at
+  INSTALL_BOOTSTRAP_TOKEN="$(random_secret)"
+  expires_at="$(date -u -d '+30 minutes' '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '{"token":"%s","expiresAt":"%s"}\n' "$INSTALL_BOOTSTRAP_TOKEN" "$expires_at" >"$INSTALL_DIR/secrets/bootstrap_token.json"
+  chown root:65532 "$INSTALL_DIR/secrets/bootstrap_token.json"
+  chmod 0640 "$INSTALL_DIR/secrets/bootstrap_token.json"
+}
+
 start_stack() {
   cd "$INSTALL_DIR"
   if [[ "$INSTALL_MODE" == "release" ]]; then
@@ -343,6 +683,8 @@ start_stack() {
     docker compose pull postgres mosquitto frigate caddy
     docker compose up -d --build
   fi
+  # API phải đọc credential bootstrap vừa làm mới kể cả khi container cũ vẫn đang chạy.
+  docker compose up -d --no-deps --force-recreate api
   for _ in $(seq 1 60); do
     if curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
       return
@@ -353,26 +695,69 @@ start_stack() {
   fail "API không khỏe sau 120 giây. Hãy kiểm tra docker compose logs api."
 }
 
+create_initial_owner() {
+  local status needs_bootstrap response_file response_code payload
+  status="$(curl -fsS http://127.0.0.1:8080/api/v1/auth/status)" || fail "Không đọc được trạng thái thiết lập Owner."
+  needs_bootstrap="$(jq -er '.needsBootstrap | if . == true then "true" elif . == false then "false" else error("invalid") end' <<<"$status")" ||
+    fail "API trả trạng thái thiết lập Owner không hợp lệ."
+  if [[ "$needs_bootstrap" == "false" ]]; then
+    OWNER_ALREADY_EXISTS="true"
+    return
+  fi
+
+  collect_owner_identity
+  INSTALL_OWNER_PASSWORD="$(random_secret)"
+  payload="$(jq -cn \
+    --arg email "$INSTALL_OWNER_EMAIL" \
+    --arg displayName "$INSTALL_OWNER_NAME" \
+    --arg password "$INSTALL_OWNER_PASSWORD" \
+    '{email:$email,displayName:$displayName,password:$password,requirePasswordChange:true}')"
+  response_file="$(mktemp)"
+  cleanup_items+=("$response_file")
+  response_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -H "X-Bootstrap-Token: $INSTALL_BOOTSTRAP_TOKEN" \
+    --data-binary @- \
+    http://127.0.0.1:8080/api/v1/auth/bootstrap <<<"$payload")" || fail "Không kết nối được API để tạo Owner."
+  if [[ "$response_code" != "201" ]]; then
+    INSTALL_OWNER_PASSWORD=""
+    fail "Không tạo được Owner: $(jq -r '.message // "API từ chối yêu cầu bootstrap."' "$response_file" 2>/dev/null || printf 'API từ chối yêu cầu bootstrap.')"
+  fi
+  OWNER_CREATED="true"
+}
+
 finish() {
   local lan_ip
   lan_ip="$(hostname -I | awk '{print $1}')"
   printf '\nQL Camera Home đã sẵn sàng.\n'
-  printf 'Mở: http://%s:8080/#token=%s\n' "$lan_ip" "$INSTALL_BOOTSTRAP_TOKEN"
-  printf 'Bootstrap token hết hạn sau 30 phút và chỉ dùng để tạo Owner đầu tiên.\n'
+  printf 'Mở: http://%s:8080/\n' "$lan_ip"
+  if [[ "$OWNER_CREATED" == "true" ]]; then
+    printf '\nThông tin Owner (chỉ hiển thị lần này):\n'
+    printf 'Tên: %s\nEmail: %s\nMật khẩu tạm: %s\n' "$INSTALL_OWNER_NAME" "$INSTALL_OWNER_EMAIL" "$INSTALL_OWNER_PASSWORD"
+    printf 'Hãy lưu lại ngay. Hệ thống sẽ bắt buộc đổi mật khẩu ở lần đăng nhập đầu tiên.\n'
+  elif [[ "$OWNER_ALREADY_EXISTS" == "true" ]]; then
+    printf 'Owner đã tồn tại; tài khoản và mật khẩu hiện tại được giữ nguyên.\n'
+  fi
   printf 'Dữ liệu: %s\nBản ghi: %s\n' "$DATA_DIR" "$MEDIA_DIR"
+  INSTALL_OWNER_PASSWORD=""
 }
 
 main() {
   require_root
+  bootstrap_environment
+  install_host_dependencies
   preflight
-  install_docker
+  ensure_docker
   download_source
   generate_configuration
   install_host_agent
+  # Làm mới token sát lúc API khởi động để quá trình build hoặc tải image lâu không làm token hết hạn.
+  refresh_bootstrap_credential
   start_stack
+  create_initial_owner
   finish
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
   main "$@"
 fi
