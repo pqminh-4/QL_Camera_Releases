@@ -14,6 +14,18 @@ curl -fsSL https://raw.githubusercontent.com/pqminh-4/QL_Camera_Releases/main/in
 
 Hai gói này phải có trước vì installer chưa thể tự kiểm tra dependency khi `install.sh` chưa được tải. Nếu máy đã có `curl` và CA certificate hoạt động, có thể bỏ qua hai lệnh APT.
 
+Khi cần xác minh installer trước khi chạy:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pqminh-4/QL_Camera_Releases/main/install.sh -o /tmp/ql-camera-install.sh
+sha256sum /tmp/ql-camera-install.sh
+grep '^DEFAULT_RELEASE_REPOSITORY=' /tmp/ql-camera-install.sh
+grep -Fxq 'DEFAULT_RELEASE_REPOSITORY="pqminh-4/QL_Camera_Releases"' /tmp/ql-camera-install.sh
+sudo bash /tmp/ql-camera-install.sh
+```
+
+Binding phải trỏ tới `pqminh-4/QL_Camera_Releases`. Nếu phép kiểm tra binding thất bại, không chạy tệp đó và tải lại từ URL public chính thức.
+
 Máy phải chạy bằng `systemd`, có APT/DPKG và kết nối Internet. Trước khi tải QL Camera, installer tự kiểm tra và cài các gói Ubuntu bắt buộc còn thiếu (`ca-certificates`, `curl`, `gnupg`, `jq`, `tar`, `gzip`, `coreutils`, `grep`, `sed`, `mawk`, `passwd`, `hostname`, `libc-bin`), đồng thời thử cài `usbutils` để nhận diện Coral USB.
 
 Nếu máy chưa có dấu vết Docker, installer cài Docker Engine, containerd, Buildx và Compose plugin từ repository Docker chính thức. Nếu Docker đã tồn tại nhưng daemon/Compose không hoạt động hoặc không tương thích, installer dừng và hướng dẫn khắc phục; không tự gỡ, thay thế hoặc nâng cấp Docker hiện hữu. Installer cũng không tự cài driver GPU/accelerator, sửa firewall hoặc reboot máy.

@@ -5,10 +5,25 @@ INSTALL_DIR="${QL_CAMERA_INSTALL_DIR:-/opt/ql-camera}"
 DATA_DIR="${QL_CAMERA_DATA_DIR:-/var/lib/ql-camera}"
 MEDIA_DIR="${QL_CAMERA_MEDIA_DIR:-/srv/ql-camera/media}"
 DEFAULT_RELEASE_REPOSITORY="pqminh-4/QL_Camera_Releases"
+# Ghép sentinel thành hai chuỗi để bước đóng gói không thay nhầm cả điều kiện phát hiện placeholder.
+UNBOUND_RELEASE_REPOSITORY="__QL_CAMERA_RELEASE_""REPOSITORY__"
 RELEASE_REPOSITORY="${QL_CAMERA_RELEASE_REPOSITORY:-${QL_CAMERA_REPOSITORY:-$DEFAULT_RELEASE_REPOSITORY}}"
 SOURCE_DIR="${QL_CAMERA_SOURCE_DIR:-}"
+# Chỉ tự nhận diện source khi Bash đang thực thi một tệp thật; installer pipe qua stdin không dùng thư mục hiện tại.
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [[ "$SCRIPT_PATH" == */* ]]; then
+  if SCRIPT_DIR="$(cd -- "${SCRIPT_PATH%/*}" 2>/dev/null && pwd -P)"; then
+    :
+  else
+    SCRIPT_DIR=""
+  fi
+elif [[ -f "$SCRIPT_PATH" ]]; then
+  SCRIPT_DIR="$(pwd -P)"
+else
+  SCRIPT_DIR=""
+fi
 AGENT_GROUP_ID="${QL_CAMERA_AGENT_GID:-1999}"
-INSTALL_MODE="source"
+INSTALL_MODE=""
 RELEASE_API_IMAGE=""
 RELEASE_WEB_IMAGE=""
 OWNER_CREATED="false"
@@ -18,6 +33,8 @@ INSTALL_OWNER_EMAIL=""
 INSTALL_OWNER_PASSWORD=""
 EXISTING_INSTALL="false"
 APT_INDEX_UPDATED="false"
+DOCKER_PULL_MAX_ATTEMPTS=4
+DOCKER_PULL_RETRY_DELAY_SECONDS=5
 
 REQUIRED_HOST_PACKAGES=(
   ca-certificates
@@ -101,8 +118,48 @@ require_root() {
   [[ "${EUID}" -eq 0 ]] || fail "Hãy chạy installer bằng sudo."
 }
 
+source_checkout_is_valid() {
+  local source="$1"
+  [[ -n "$source" && -f "$source/docker-compose.yml" && -f "$source/package.json" &&
+    -f "$source/pnpm-workspace.yaml" && -f "$source/apps/api/package.json" &&
+    -f "$source/apps/web/package.json" && -f "$source/apps/host-agent/go.mod" &&
+    -f "$source/scripts/build-release-bundle.sh" ]]
+}
+
+resolve_install_mode() {
+  local resolved_source
+  if [[ -n "$SOURCE_DIR" ]]; then
+    source_checkout_is_valid "$SOURCE_DIR" ||
+      fail "QL_CAMERA_SOURCE_DIR không trỏ tới source checkout QL Camera hợp lệ."
+    resolved_source="$(cd -- "$SOURCE_DIR" 2>/dev/null && pwd -P)" ||
+      fail "Không truy cập được QL_CAMERA_SOURCE_DIR."
+    SOURCE_DIR="$resolved_source"
+    INSTALL_MODE="source"
+    return
+  fi
+
+  if source_checkout_is_valid "$SCRIPT_DIR"; then
+    SOURCE_DIR="$SCRIPT_DIR"
+    INSTALL_MODE="source"
+    return
+  fi
+
+  if [[ "$RELEASE_REPOSITORY" == "$UNBOUND_RELEASE_REPOSITORY" ]]; then
+    fail "Installer chưa được gắn repository phát hành và không nằm trong source checkout hợp lệ. Hãy tải installer chính thức tại https://raw.githubusercontent.com/pqminh-4/QL_Camera_Releases/main/install.sh"
+  fi
+  [[ "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+    fail "QL_CAMERA_RELEASE_REPOSITORY phải có dạng owner/repository."
+  INSTALL_MODE="release"
+}
+
 systemd_is_running() {
   [[ -d /run/systemd/system ]] && systemctl show --property=Version --value >/dev/null 2>&1
+}
+
+load_os_release() {
+  [[ -r /etc/os-release ]] || return 1
+  # shellcheck disable=SC1091
+  source /etc/os-release
 }
 
 bootstrap_environment() {
@@ -114,9 +171,7 @@ bootstrap_environment() {
   command -v dpkg >/dev/null 2>&1 || fail "Máy thiếu DPKG; installer chỉ hỗ trợ Ubuntu Server dùng APT/DPKG."
   command -v dpkg-query >/dev/null 2>&1 || fail "Máy thiếu dpkg-query; hãy sửa bộ quản lý gói trước khi cài QL Camera."
   command -v systemctl >/dev/null 2>&1 || fail "Máy thiếu systemctl; QL Camera cần Ubuntu Server chạy bằng systemd."
-  [[ -r /etc/os-release ]] || fail "Không nhận diện được hệ điều hành."
-  # shellcheck disable=SC1091
-  source /etc/os-release
+  load_os_release || fail "Không nhận diện được hệ điều hành."
   [[ "${ID:-}" == "ubuntu" ]] || fail "Bản đầu chỉ hỗ trợ Ubuntu Server."
   case "${VERSION_ID:-}" in
     24.04|26.04) ;;
@@ -409,14 +464,12 @@ validate_release_archive() {
 
 download_source() {
   mkdir -p "$INSTALL_DIR"
-  if [[ -n "$SOURCE_DIR" ]]; then
-    [[ -f "$SOURCE_DIR/docker-compose.yml" ]] || fail "QL_CAMERA_SOURCE_DIR không trỏ tới source hợp lệ."
+  if [[ "$INSTALL_MODE" == "source" ]]; then
+    source_checkout_is_valid "$SOURCE_DIR" || fail "Source checkout đã thay đổi hoặc không còn hợp lệ."
     copy_source_checkout "$SOURCE_DIR" "$INSTALL_DIR"
-    INSTALL_MODE="source"
     return
   fi
-  [[ "$RELEASE_REPOSITORY" != "pqminh-4/QL_Camera_Releases" ]] || fail "Installer chưa được gắn repository phát hành."
-  [[ "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "QL_CAMERA_RELEASE_REPOSITORY phải có dạng owner/repository."
+  [[ "$INSTALL_MODE" == "release" ]] || fail "Chế độ cài đặt chưa được xác định."
   local temp_dir release_json version bundle_name bundle_checksum_name agent_name agent_checksum_name manifest_name
   local bundle_url bundle_checksum_url agent_url agent_checksum_url manifest_url staging_dir
   temp_dir="$(mktemp -d)"
@@ -466,7 +519,9 @@ download_source() {
   staging_dir="$temp_dir/bundle"
   mkdir -p "$staging_dir"
   tar --no-same-owner --no-same-permissions -xzf "$temp_dir/$bundle_name" -C "$staging_dir"
-  [[ -f "$staging_dir/docker-compose.yml" && -f "$staging_dir/apps/host-agent/ql-camera-agent.service" ]] || fail "Deploy bundle thiếu cấu hình runtime bắt buộc."
+  [[ -f "$staging_dir/docker-compose.yml" &&
+    -f "$staging_dir/apps/host-agent/ql-camera-agent.service" &&
+    -f "$staging_dir/apps/host-agent/ql-camera-stack.service" ]] || fail "Deploy bundle thiếu cấu hình runtime bắt buộc."
   # Xóa source legacy trong thư mục ứng dụng nhưng giữ nguyên secret, dữ liệu và cấu hình runtime.
   rm -rf -- "$INSTALL_DIR/apps" "$INSTALL_DIR/packages" "$INSTALL_DIR/deploy"
   copy_source_checkout "$staging_dir" "$INSTALL_DIR"
@@ -657,10 +712,14 @@ install_host_agent() {
   fi
   install -D -m 0755 "$INSTALL_DIR/apps/host-agent/ql-camera-agent" /usr/local/lib/ql-camera/ql-camera-agent
   install -m 0644 "$INSTALL_DIR/apps/host-agent/ql-camera-agent.service" /etc/systemd/system/ql-camera-agent.service
+  install -m 0644 "$INSTALL_DIR/apps/host-agent/ql-camera-stack.service" /etc/systemd/system/ql-camera-stack.service
   printf 'QL_CAMERA_PROJECT_DIR=%q\nQL_CAMERA_MEDIA_DIR=%q\n' "$INSTALL_DIR" "$MEDIA_DIR" >/etc/default/ql-camera-agent
   chmod 0644 /etc/default/ql-camera-agent
   systemctl daemon-reload
-  systemctl enable --now ql-camera-agent.service
+  systemctl enable ql-camera-agent.service
+  systemctl enable ql-camera-stack.service
+  # Restart để bản nâng cấp áp dụng ngay đường dẫn socket và thứ tự khởi động mới.
+  systemctl restart ql-camera-agent.service
 }
 
 refresh_bootstrap_credential() {
@@ -672,15 +731,36 @@ refresh_bootstrap_credential() {
   chmod 0640 "$INSTALL_DIR/secrets/bootstrap_token.json"
 }
 
+pull_compose_images() {
+  local attempt=1 delay="$DOCKER_PULL_RETRY_DELAY_SECONDS"
+  while (( attempt <= DOCKER_PULL_MAX_ATTEMPTS )); do
+    if docker compose pull "$@"; then
+      return 0
+    fi
+    if (( attempt == DOCKER_PULL_MAX_ATTEMPTS )); then
+      return 1
+    fi
+    # Docker giữ lại các layer đã tải; lần thử sau chỉ tiếp tục phần còn thiếu hoặc lỗi tạm thời.
+    printf 'Cảnh báo: tải image thất bại ở lượt %d/%d; thử lại sau %d giây.\n' \
+      "$attempt" "$DOCKER_PULL_MAX_ATTEMPTS" "$delay" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+  return 1
+}
+
 start_stack() {
   cd "$INSTALL_DIR"
   if [[ "$INSTALL_MODE" == "release" ]]; then
     note "Tải image đã phát hành và khởi động các service"
-    docker compose pull postgres mosquitto frigate api web caddy
+    pull_compose_images postgres mosquitto frigate api web caddy ||
+      fail "Không tải đủ image sau ${DOCKER_PULL_MAX_ATTEMPTS} lượt. Hãy kiểm tra kết nối tới registry/CDN rồi chạy lại installer."
     docker compose up -d --no-build
   else
     note "Build source local và khởi động các service"
-    docker compose pull postgres mosquitto frigate caddy
+    pull_compose_images postgres mosquitto frigate caddy ||
+      fail "Không tải đủ image sau ${DOCKER_PULL_MAX_ATTEMPTS} lượt. Hãy kiểm tra kết nối tới registry/CDN rồi chạy lại installer."
     docker compose up -d --build
   fi
   # API phải đọc credential bootstrap vừa làm mới kể cả khi container cũ vẫn đang chạy.
@@ -744,6 +824,7 @@ finish() {
 
 main() {
   require_root
+  resolve_install_mode
   bootstrap_environment
   install_host_dependencies
   preflight
