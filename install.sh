@@ -35,6 +35,8 @@ EXISTING_INSTALL="false"
 APT_INDEX_UPDATED="false"
 DOCKER_PULL_MAX_ATTEMPTS=4
 DOCKER_PULL_RETRY_DELAY_SECONDS=5
+COMPOSE_LOCK_FILE="/run/ql-camera-compose.lock"
+COMPOSE_LOCK_WAIT_SECONDS=300
 
 REQUIRED_HOST_PACKAGES=(
   ca-certificates
@@ -50,6 +52,7 @@ REQUIRED_HOST_PACKAGES=(
   passwd
   hostname
   libc-bin
+  util-linux
 )
 OPTIONAL_HOST_PACKAGES=(usbutils)
 REQUIRED_HOST_COMMANDS=(
@@ -76,6 +79,7 @@ REQUIRED_HOST_COMMANDS=(
   seq
   mktemp
   readlink
+  flock
   cp
   chown
   chmod
@@ -750,7 +754,7 @@ pull_compose_images() {
   return 1
 }
 
-start_stack() {
+start_stack_locked() {
   cd "$INSTALL_DIR"
   if [[ "$INSTALL_MODE" == "release" ]]; then
     note "Tải image đã phát hành và khởi động các service"
@@ -773,6 +777,17 @@ start_stack() {
   done
   docker compose ps
   fail "API không khỏe sau 120 giây. Hãy kiểm tra docker compose logs api."
+}
+
+start_stack() {
+  local lock_fd
+  exec {lock_fd}>"$COMPOSE_LOCK_FILE"
+  # Dùng chung khóa với unit boot để installer không chạy Compose chồng lên quá trình reconcile.
+  flock --wait "$COMPOSE_LOCK_WAIT_SECONDS" "$lock_fd" ||
+    fail "Không lấy được khóa Compose sau ${COMPOSE_LOCK_WAIT_SECONDS} giây. Hãy kiểm tra systemctl status ql-camera-stack."
+  start_stack_locked
+  flock --unlock "$lock_fd"
+  exec {lock_fd}>&-
 }
 
 create_initial_owner() {
