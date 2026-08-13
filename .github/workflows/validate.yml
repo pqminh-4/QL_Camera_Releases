@@ -1,0 +1,28 @@
+name: Validate public distribution
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kiểm tra installer và ranh giới phân phối
+        run: |
+          shellcheck install.sh
+          bash -n install.sh
+          grep -Eq '^DEFAULT_RELEASE_REPOSITORY="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"$' install.sh
+          placeholder='__QL_CAMERA_RELEASE_''REPOSITORY__'
+          ! grep -R -n "$placeholder" install.sh README.md SECURITY.md
+          if find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.go' -o -name '*.map' -o -name '*.env' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
+            echo 'Repository public chứa source hoặc secret bị cấm.' >&2
+            exit 1
+          fi
