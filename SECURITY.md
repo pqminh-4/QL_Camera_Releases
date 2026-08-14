@@ -7,3 +7,5 @@ Khi báo cáo lỗ hổng, hãy dùng kênh liên hệ riêng do chủ sở hữ
 Installer chính thức chỉ tải artifact từ `pqminh-4/QL_Camera_Releases`, xác minh SHA-256 và chỉ chấp nhận image `ghcr.io` được ghim bằng digest.
 
 Thông tin đăng nhập Owner được gửi trực tiếp tới API nội bộ qua loopback. Mật khẩu tạm không được lưu dạng rõ và chỉ hiển thị một lần trong terminal sau khi tạo Owner thành công; người dùng phải đổi mật khẩu trước khi truy cập chức năng nghiệp vụ.
+
+Webhook public chỉ được gọi qua HTTPS tới IP global; webhook LAN chỉ nhận RFC1918/ULA sau khi Owner chọn scope. Runtime ghim DNS cho từng kết nối, kiểm lại redirect và chặn loopback, link-local, metadata, multicast cùng tên dịch vụ Docker. Passkey yêu cầu HTTPS hoặc localhost. Backup cấu hình/vault được mã hóa AES-256-GCM với scrypt và không chứa media Frigate.

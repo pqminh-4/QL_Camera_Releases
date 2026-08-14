@@ -517,6 +517,8 @@ download_source() {
   [[ "$(jq -er '.commit | select(test("^[a-f0-9]{40}$"))' "$temp_dir/$manifest_name")" ]] || fail "Commit trong manifest không hợp lệ."
   RELEASE_API_IMAGE="$(jq -er '.images.api' "$temp_dir/$manifest_name")" || fail "Manifest thiếu image API."
   RELEASE_WEB_IMAGE="$(jq -er '.images.web' "$temp_dir/$manifest_name")" || fail "Manifest thiếu image web."
+  RELEASE_VERSION="$(jq -er '.version' "$temp_dir/$manifest_name")" || fail "Manifest thiếu version."
+  RELEASE_COMMIT="$(jq -er '.commit' "$temp_dir/$manifest_name")" || fail "Manifest thiếu commit."
   validate_image_digest "$RELEASE_API_IMAGE" || fail "Image API không được ghim bằng GHCR digest hợp lệ."
   validate_image_digest "$RELEASE_WEB_IMAGE" || fail "Image web không được ghim bằng GHCR digest hợp lệ."
   validate_release_archive "$temp_dir/$bundle_name"
@@ -661,7 +663,7 @@ generate_configuration() {
   web_image="${RELEASE_WEB_IMAGE:-ql-camera-web:local}"
   local env_keys=(
     POSTGRES_DB POSTGRES_USER FRIGATE_RTSP_PASSWORD QL_CAMERA_DATA_DIR QL_CAMERA_MEDIA_DIR
-    QL_CAMERA_DOMAIN QL_CAMERA_AGENT_GID QL_CAMERA_API_IMAGE QL_CAMERA_WEB_IMAGE WEB_PORT PUBLIC_ORIGIN TZ
+    QL_CAMERA_DOMAIN QL_CAMERA_AGENT_GID QL_CAMERA_API_IMAGE QL_CAMERA_WEB_IMAGE QL_CAMERA_VERSION QL_CAMERA_COMMIT WEB_PORT PUBLIC_ORIGIN TZ
   )
   if env_needs_update "$env_path" "${env_keys[@]}" && [[ -s "$env_path" ]]; then
     cp -a "$env_path" "$env_path.backup-$(date -u '+%Y%m%dT%H%M%SZ')"
@@ -676,9 +678,13 @@ generate_configuration() {
   if [[ "$INSTALL_MODE" == "release" ]]; then
     set_env_value "$env_path" QL_CAMERA_API_IMAGE "$api_image"
     set_env_value "$env_path" QL_CAMERA_WEB_IMAGE "$web_image"
+    set_env_value "$env_path" QL_CAMERA_VERSION "${RELEASE_VERSION:-unknown}"
+    set_env_value "$env_path" QL_CAMERA_COMMIT "${RELEASE_COMMIT:-unknown}"
   else
     ensure_env_value "$env_path" QL_CAMERA_API_IMAGE "$api_image"
     ensure_env_value "$env_path" QL_CAMERA_WEB_IMAGE "$web_image"
+    ensure_env_value "$env_path" QL_CAMERA_VERSION "${QL_CAMERA_VERSION:-development}"
+    ensure_env_value "$env_path" QL_CAMERA_COMMIT "${QL_CAMERA_COMMIT:-development}"
   fi
   ensure_env_value "$env_path" WEB_PORT 8080
   ensure_env_value "$env_path" PUBLIC_ORIGIN http://localhost:8080
