@@ -30,7 +30,9 @@ Máy phải chạy bằng `systemd`, có APT/DPKG và kết nối Internet. Trư
 
 Nếu máy chưa có dấu vết Docker, installer cài Docker Engine, containerd, Buildx và Compose plugin từ repository Docker chính thức. Nếu Docker đã tồn tại nhưng daemon/Compose không hoạt động hoặc không tương thích, installer dừng và hướng dẫn khắc phục; không tự gỡ, thay thế hoặc nâng cấp Docker hiện hữu. Installer cũng không tự cài driver GPU/accelerator, sửa firewall hoặc reboot máy.
 
-Sau khi dependency đạt, installer hỏi tên và email, xác minh checksum của deploy bundle/host-agent, khởi động API/web bằng image GHCR public đã ghim SHA-256 digest rồi tự tạo Owner. Mật khẩu tạm chỉ xuất hiện một lần trong terminal và phải được đổi ở lần đăng nhập đầu.
+Sau khi dependency đạt, installer hỏi tên và email, xác minh checksum của deploy bundle/host-agent, khởi động API/web bằng image GHCR public đã ghim SHA-256 digest rồi tự tạo Owner. Mật khẩu tạm chỉ xuất hiện một lần trong terminal và phải được đổi ở lần đăng nhập đầu. Base chỉ mở LAN `8080`; TCP `80/443` và Coturn chỉ được kích hoạt khi Owner chọn Direct/Proxy và preflight cổng đạt.
+
+Bản runtime hỗ trợ nhiều khung lịch theo timezone, camera group/privacy/PTZ, USB V4L2/Coral/VAAPI qua allowlist, durable webhook retry/dead-letter, passkey, incident package, backup mã hóa và update/rollback theo release manifest. Driver GPU/accelerator không được installer tự cài.
 
 Với môi trường không có terminal tương tác trên Ubuntu sạch:
 
